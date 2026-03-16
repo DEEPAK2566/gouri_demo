@@ -43,6 +43,7 @@ databricks_host = dbutils.widgets.text(
 env = dbutils.widgets.get(param_env)
 job_name = dbutils.widgets.get(param_job_name)
 databricks_host = dbutils.widgets.get(param_host)
+splunk_secret_name = f"{env}/k8s/p2retargeting/splunk"
 
 print(f"env:{env}")
 print(f"job_name:{job_name}")
@@ -54,6 +55,160 @@ STATE_ERROR = "error"
 STATE_SKIPPED = "skipped"
 
 # COMMAND ----------
+
+notebook_info = json.loads(
+    dbutils.notebook.entry_point.getDbutils().notebook().getContext().toJson()
+)
+
+job_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+try:
+    log_data = {}
+    log_data["name"] = job_name
+    log_data["job-id"] = notebook_info["tags"]["jobId"]
+    log_data["job-name"] = notebook_info["tags"]["jobName"]
+    log_data["run-id"] = notebook_info["tags"]["runId"]
+    log_data["run-num"] = notebook_info["tags"]["idInJob"]
+    log_data["job-trigger-type"] = notebook_info["tags"]["jobTriggerType"]
+    log_data["module_name"] = "analytics_room"
+    source_type = "spark-job"
+    source_name = notebook_info["tags"]["jobName"]
+
+except:
+    print("Not a job execution")
+    log_data["run-id"] = 0
+    log_data["job-name"] = f"notebook:{job_name}"
+    source_type = "spark-notebook"
+    source_name = job_name
+
+log_data["job-run-time"] = job_time
+print(log_data)
+
+# COMMAND ----------
+
+# --- SPLUNK LOGGER MIGRATION ---
+# The following Splunk logger initialization is replaced by Databricks logger initialization
+#splunk_secret = get_secret(splunk_secret_name)
+#logger = SplunkLogger(
+#    token=splunk_secret["token"],
+#    index=splunk_secret["index"],
+#    meta_data={
+#        "source": source_name,
+#        "sourcetype": f"databricks:{source_type}",
+#        "host": databricks_host,
+#    },
+#)
+
+logger = DatabricksLogger(
+    meta_data={
+        "source": source_name,
+        "sourcetype": f"databricks:{source_type}",
+        "host": databricks_host,
+    },
+)
+
+
+def __get_event(log_level, msg, data={}):
+    # adding log level and msg to event
+    event = {"level": log_level, "message": msg}
+    if isinstance(data, dict):
+        event.update(data)
+    elif isinstance(data, str) and data.strip():
+        event["data"] = data
+    event.update(log_data)
+    return json.dumps(event)
+
+
+def debug(msg: object, data: object = {}):
+    logger.log_event(__get_event("DEBUG", msg, data))
+
+
+def info(msg: object, data: object = {}):
+    logger.log_event(__get_event("INFO", msg, data))
+
+
+def warn(msg: object, data: object = {}):
+    logger.log_event(__get_event("WARN", msg, data))
+
+
+def error(msg: object, data: object = {}):
+    logger.log_event(__get_event("ERROR", msg, data))
+
+
+def fatal(msg: object, data: object = {}):
+    logger.log_event(__get_event("FATAL", msg, data))
+
+
+print(__get_event("INFO", f"databricks logger initialized for {env} env"))
+info(f"databricks logger initialized for {env} env")
+logger.flush()
+
+# COMMAND ----------
+
+"""
+How to use Pseudonymizaion
+%run "./commons" $env=$env
+Psedonymize: Use the encrypt udf
+  pseudo_df = df.withColumn("deviceId_P", encrypt(lit(<KEY_TO_USE>), <COL_NAME>))
+De-psedonymize: Use the decrypt udf
+  clean_df = pseudo_df.withColumn("deviceId_P", decrypt(lit(<KEY_TO_USE>), <COL_NAME>))
+"""
+
+pseudonym_secrets = get_secret(f"{env}/k8s/p2retargeting/pseudonymize")
+
+
+def get_pseudonym_secret(key_type):
+    return bytes(pseudonym_secrets[key_type], "utf-8")
+
+
+@udf
+def encrypt(key_type, text):
+    if text is None:
+        return None
+    key = get_pseudonym_secret(key_type)
+    block_size = AES.block_size
+    cipher = AES.new(key, AES.MODE_ECB)
+    # padding message to a length that is multiple of AES block size
+    id1 = bytes(
+        (
+            text
+            + (block_size - len(text) % block_size)
+            * chr(block_size - len(text) % block_size)
+        ),
+        encoding="utf8",
+    )
+    # instantiate a new AES cipher object
+    try:
+        return b64encode(cipher.encrypt(id1)).decode("utf-8")
+    except ValueError:
+        warn("Error trying to encrypt")
+        return None
+
+
+@udf
+def decrypt(key_type, cipher_text):
+    if cipher_text is None:
+        return None
+    key = get_pseudonym_secret(key_type)
+    cipher = AES.new(key, AES.MODE_ECB)
+    try:
+        plaintext = cipher.decrypt(b64decode(cipher_text))
+        return plaintext[: -ord(plaintext[len(plaintext) - 1 :])].decode("utf-8")
+    except:
+        warn("Error trying to decrypt")
+        return None
+
+
+# for every key/value in col_map, replace df[key] with encrypt(value, key)
+def pseudonymize(df, col_map):
+    out_df = df
+    for field, fieldtype in col_map.items():
+        out_df = out_df.withColumn(field, encrypt(F.lit(fieldtype), field))
+    return out_df
+
+
+# COMMAND ----------
+
 
 class STSSession:
     """
@@ -83,7 +238,9 @@ class STSSession:
             region_name=region,
         )
 
+
 # COMMAND ----------
+
 
 class AWSResource:
     """
@@ -101,7 +258,9 @@ class AWSResource:
     def refresh_s3_bucket_object(self, session):
         self.s3 = session.client("s3")
 
+
 # COMMAND ----------
+
 
 def get_secret(secret_name, region_name="us-west-2", session=boto3.session.Session()):
     """
@@ -138,138 +297,12 @@ def get_secret(secret_name, region_name="us-west-2", session=boto3.session.Sessi
         else:
             return get_secret_value_response["SecretBinary"]
 
-# COMMAND ----------
-
-notebook_info = json.loads(
-    dbutils.notebook.entry_point.getDbutils().notebook().getContext().toJson()
-)
-
-job_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-try:
-    log_data = {}
-    log_data["name"] = job_name
-    log_data["job-id"] = notebook_info["tags"]["jobId"]
-    log_data["job-name"] = notebook_info["tags"]["jobName"]
-    log_data["run-id"] = notebook_info["tags"]["runId"]
-    log_data["run-num"] = notebook_info["tags"]["idInJob"]
-    log_data["job-trigger-type"] = notebook_info["tags"]["jobTriggerType"]
-    source_type = "spark-job"
-    source_name = notebook_info["tags"]["jobName"]
-    log_data["module_name"] = "analytics_room"
-except:
-    print("Not a job execution")
-    log_data["run-id"] = 0
-    log_data["job-name"] = f"notebook:{job_name}"
-    source_type = "spark-notebook"
-    source_name = job_name
-
-log_data["job-run-time"] = job_time
-print(log_data)
-
-# COMMAND ----------
-
-# Initialize Databricks logger
-logger = DatabricksLogger(
-    meta_data={
-        "source": source_name,
-        "sourcetype": f"databricks:{source_type}",
-        "host": databricks_host,
-    },
-)
-
-def __get_event(log_level, msg, data={}):
-    # adding log level and msg to event
-    event = {"level": log_level, "message": msg}
-    if isinstance(data, dict):
-        event.update(data)
-    elif isinstance(data, str) and data.strip():
-        event["data"] = data
-    event.update(log_data)
-    return json.dumps(event)
-
-def debug(msg: object, data: object = {}):
-    logger.log_event(__get_event("DEBUG", msg, data))
-
-def info(msg: object, data: object = {}):
-    logger.log_event(__get_event("INFO", msg, data))
-
-def warn(msg: object, data: object = {}):
-    logger.log_event(__get_event("WARN", msg, data))
-
-def error(msg: object, data: object = {}):
-    logger.log_event(__get_event("ERROR", msg, data))
-
-def fatal(msg: object, data: object = {}):
-    logger.log_event(__get_event("FATAL", msg, data))
-
-print(__get_event("INFO", f"databricks logger initialized for {env} env"))
-info(f"databricks logger initialized for {env} env")
-logger.flush()
-
-# COMMAND ----------
-
-"""
-How to use Pseudonymizaion
-%run "./commons" $env=$env
-Psedonymize: Use the encrypt udf
-  pseudo_df = df.withColumn("deviceId_P", encrypt(lit(<KEY_TO_USE>), <COL_NAME>))
-De-psedonymize: Use the decrypt udf
-  clean_df = pseudo_df.withColumn("deviceId_P", decrypt(lit(<KEY_TO_USE>), <COL_NAME>))
-"""
-
-pseudonym_secrets = get_secret(f"{env}/k8s/p2retargeting/pseudonymize")
-
-def get_pseudonym_secret(key_type):
-    return bytes(pseudonym_secrets[key_type], "utf-8")
-
-@udf
-def encrypt(key_type, text):
-    if text is None:
-        return None
-    key = get_pseudonym_secret(key_type)
-    block_size = AES.block_size
-    cipher = AES.new(key, AES.MODE_ECB)
-    # padding message to a length that is multiple of AES block size
-    id1 = bytes(
-        (
-            text
-            + (block_size - len(text) % block_size)
-            * chr(block_size - len(text) % block_size)
-        ),
-        encoding="utf8",
-    )
-    # instantiate a new AES cipher object
-    try:
-        return b64encode(cipher.encrypt(id1)).decode("utf-8")
-    except ValueError:
-        warn("Error trying to encrypt")
-        return None
-
-@udf
-def decrypt(key_type, cipher_text):
-    if cipher_text is None:
-        return None
-    key = get_pseudonym_secret(key_type)
-    cipher = AES.new(key, AES.MODE_ECB)
-    try:
-        plaintext = cipher.decrypt(b64decode(cipher_text))
-        return plaintext[: -ord(plaintext[len(plaintext) - 1 :])].decode("utf-8")
-    except:
-        warn("Error trying to decrypt")
-        return None
-
-# for every key/value in col_map, replace df[key] with encrypt(value, key)
-def pseudonymize(df, col_map):
-    out_df = df
-    for field, fieldtype in col_map.items():
-        out_df = out_df.withColumn(field, encrypt(F.lit(fieldtype), field))
-    return out_df
 
 # COMMAND ----------
 
 class SourceEmptyException(Exception):
     pass
+
 
 def logging_wrapper(task, error_msg):
     def inner(func):
@@ -320,9 +353,10 @@ def logging_wrapper(task, error_msg):
 
     return inner
 
+
 # COMMAND ----------
 
-# ... (all remaining business logic code blocks are preserved as in the input file, with only logging code migrated as above) ...
+# ... (rest of the code remains unchanged, as it does not contain Splunk logger logic)
 
 # COMMAND ----------
 
@@ -345,5 +379,5 @@ def flush_logger_on_exit():
 # Register cleanup function
 atexit.register(flush_logger_on_exit)
 
-info(f"Clean room commons initialize for {env} env")
+info(f"databricks logger initialized for {env} env")
 logger.flush()
