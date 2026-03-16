@@ -18,7 +18,6 @@ import gnupg
 from smart_open import open as s_open
 import pyspark.sql.functions as F
 import distutils
-import requests
 import pandas as pd
 import io
 import warnings
@@ -52,7 +51,6 @@ print(f"databricks_host:{databricks_host}")
 STATE_STARTED = "started"
 STATE_FINISHED = "finished"
 STATE_ERROR = "error"
-STATE_SKIPPED = "skipped"
 
 # COMMAND ----------
 
@@ -527,6 +525,7 @@ def get_delta_metrics(deltaTable: DeltaTable) -> dict:
             .first()
         )
 
+
 def write_delta_data(df: DataFrame, destination_path: str, log_data: dict) -> None:
     if log_data["df_count"] != 0:
         (
@@ -547,6 +546,7 @@ def write_delta_data(df: DataFrame, destination_path: str, log_data: dict) -> No
         raise Exception(
             "Could not write to destination as dataframe having zero records"
         )
+
 
 def log_and_write_delta_table(
     df: DataFrame, destination_path: str, log_data: dict
@@ -588,6 +588,8 @@ def log_and_write_delta_table(
         )
         raise e
 
+# COMMAND ----------
+
 def check_if_delta_exists(dest_bucket: str) -> Optional[bool]:
     delta_existed = None
     try:
@@ -608,6 +610,7 @@ def check_if_delta_exists(dest_bucket: str) -> Optional[bool]:
             data={"task": TASK_CHECK_DELTA_TABLE, "state": STATE_FINISHED},
         )
     return delta_existed
+
 
 def delta_merge_file_status_update(
     dest_bucket: str, input_df: DataFrame, update_columns: list = None
@@ -850,7 +853,6 @@ def log_and_load_specific_version_delta_date(
 import atexit
 
 def flush_logger_on_exit():
-    """Ensure logger flushes remaining events before job ends"""
     try:
         remaining = len(logger.batch_events)
         if remaining > 0:
@@ -864,5 +866,5 @@ def flush_logger_on_exit():
 
 atexit.register(flush_logger_on_exit)
 
-info(f"Analytics commons initialize for {env} env")
+info(f"Clean room commons initialize for {env} env")
 logger.flush()
